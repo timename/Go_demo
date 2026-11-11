@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Go LLM Gateway</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family:-apple-system,"Microsoft YaHei","PingFang SC",sans-serif;
+    background:#0f1115; color:#e6e6e6; min-height:100vh;
+    display:flex; justify-content:center; padding:32px 16px;
+  }
+  .wrap { width:100%; max-width:760px; }
+  h1 { font-size:20px; font-weight:600; margin-bottom:4px; }
+  .sub { font-size:13px; color:#8a8f98; margin-bottom:20px; }
+  .card {
+    background:#171a21; border:1px solid #242832; border-radius:10px;
+    padding:18px; margin-bottom:16px;
+  }
+  .row { display:flex; gap:10px; }
+  input {
+    flex:1; padding:11px 14px; background:#0f1115; color:#e6e6e6;
+    border:1px solid #2a2f3a; border-radius:8px; font-size:14px;
+    font-family:inherit; outline:none;
+  }
+  input:focus { border-color:#4c8dff; }
+  button {
+    padding:11px 22px; background:#4c8dff; color:#fff; border:none;
+    border-radius:8px; font-size:14px; font-weight:500; cursor:pointer;
+    font-family:inherit; white-space:nowrap;
+  }
+  button:hover:not(:disabled) { background:#3a7ae8; }
+  button:disabled { background:#2a2f3a; color:#5a6270; cursor:not-allowed; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  .chip {
+    padding:6px 12px; background:#20242e; border:1px solid #2a2f3a;
+    border-radius:14px; font-size:12.5px; color:#a8afbc; cursor:pointer;
+  }
+  .chip:hover { border-color:#4c8dff; color:#4c8dff; }
+  #out {
+    background:#0f1115; border:1px solid #242832; border-radius:8px;
+    padding:16px; min-height:120px; font-size:14px; line-height:1.75;
+    white-space:pre-wrap; word-break:break-word;
+  }
+  .meta { font-size:12px; color:#6b7280; margin-top:10px; font-family:Consolas,monospace; }
+  .err { color:#ff6b6b; }
+  .cursor {
+    display:inline-block; width:8px; height:16px; background:#4c8dff;
+    vertical-align:text-bottom; animation:blink 1s step-end infinite;
+  }
+  @keyframes blink { 50% { opacity:0; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Go LLM Gateway</h1>
+  <div class="sub">SSE 流式输出 · 指数退避重试 · 调用统计</div>
+
+  <div class="card">
+    <div class="row">
+      <input id="q" type="text" placeholder="输入问题，例如：用一句话解释什么是 SSE" autocomplete="off">
+      <button id="btn" onclick="run()">发送</button>
+    </div>
+    <div class="chips">
+      <div class="chip" onclick="quick('用一句话解释什么是SSE')">什么是 SSE</div>
+      <div class="chip" onclick="quick('Go 和 Python 最大的区别是什么？一句话')">Go vs Python</div>
+      <div class="chip" onclick="quick('写一个三行的 Go 示例，演示 goroutine')">goroutine 示例</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="out" style="color:#5a6270">等待输入…</div>
+    <div class="meta" id="meta"></div>
+  </div>
+</div>
+
+<script>
+const qEl = document.getElementById('q');
+const btn = document.getElementById('btn');
+const out = document.getElementById('out');
+const meta = document.getElementById('meta');
+let es = null;
+
+function quick(text) {
+  qEl.value = text;
+  run();
+}
+
+qEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !btn.disabled) run();
+});
+
+function run() {
+  const q = qEl.value.trim();
+  if (!q) { qEl.focus(); return; }
+
+  if (es) { es.close(); es = null; }
+
+  btn.disabled = true;
+  out.textContent = '';
+  out.style.color = '#e6e6e6';
+  meta.textContent = '连接中…';
+
+  const t0 = performance.now();
+  let chunks = 0;
+  let cursor = null;
+
+  es = new EventSource('/chat/stream?q=' + encodeURIComponent(q));
+
+  es.onopen = () => { meta.textContent = '已连接，等待首个 token…'; };
+
+  es.onmessage = ev => {
+    let data;
+    try { data = JSON.parse(ev.data); } catch { return; }
+
+    if (data.type === 'delta') {
+      if (!cursor) {
+        cursor = document.createElement('span');
+        cursor.className = 'cursor';
+        out.appendChild(cursor);
+      }
+      cursor.insertAdjacentText('beforebegin', data.text);
+      chunks++;
+      meta.textContent = `已接收 ${chunks} 段 · ${Math.round(performance.now() - t0)}ms`;
+    } else if (data.type === 'done') {
+      if (cursor) { cursor.remove(); cursor = null; }
+      meta.textContent = `完成 · ${chunks} 段 · ${Math.round(performance.now() - t0)}ms · 模型 ${data.model || '-'}`;
+      finish();
+    } else if (data.type === 'error') {
+      if (cursor) { cursor.remove(); cursor = null; }
+      out.classList.add('err');
+      out.textContent = '错误：' + data.text;
+      meta.textContent = '请求失败';
+      finish();
+    }
+  };
+
+  es.onerror = () => {
+    if (es && es.readyState === EventSource.CLOSED) {
+      finish();
+    } else {
+      out.classList.add('err');
+      out.textContent = '连接中断';
+      finish();
+    }
+  };
+}
+
+function finish() {
+  btn.disabled = false;
+  if (es) { es.close(); es = null; }
+}
+</script>
+</body>
+</html>
