@@ -297,13 +297,41 @@ func (c *LLMClient) AskStream(ctx context.Context, question string, onChunk func
 
 // extractDelta 从流式事件里尽力提取文本增量。
 // 兼容两类常见写法：
-//  1. {"type":"response.output_text.delta","delta":"..."}
-//  2. {"choices":[{"delta":{"content":"..."}}]}
+// extractDelta 从流式事件里尽力提取文本增量。
+//
+// 不同上游/不同协议的字段名不一致，这里按"能取到就用"的顺序兜底：
+//  1. {"delta": "..."}                                    OpenAI Responses
+//  2. {"delta": {"text": "..."}}                          部分兼容实现
+//  3. {"delta": {"content": "..."}}                       同上
+//  4. {"type": "response.output_text.delta", "text": "..."}  字段名在顶层
+//  5. {"choices": [{"delta": {"content": "..."}}]}         OpenAI Chat Completions
+//
+// 返回空串表示这不是一个文本增量事件（如 response.completed），调用方跳过即可。
 func extractDelta(event map[string]any) string {
-	if d, ok := event["delta"].(string); ok && d != "" {
-		return d
+	// 1~3：delta 字段，可能是字符串也可能是对象
+	if raw, ok := event["delta"]; ok {
+		switch v := raw.(type) {
+		case string:
+			if v != "" {
+				return v
+			}
+		case map[string]any:
+			for _, key := range []string{"text", "content"} {
+				if s, ok := v[key].(string); ok && s != "" {
+					return s
+				}
+			}
+		}
 	}
 
+	// 4：文本直接放在事件顶层（配合 type 判断，避免误取其他字段）
+	if t, ok := event["type"].(string); ok && strings.HasSuffix(t, "output_text.delta") {
+		if s, ok := event["text"].(string); ok && s != "" {
+			return s
+		}
+	}
+
+	// 5：Chat Completions 风格
 	if choices, ok := event["choices"].([]any); ok {
 		for _, raw := range choices {
 			choice, ok := raw.(map[string]any)
@@ -319,14 +347,17 @@ func extractDelta(event map[string]any) string {
 			}
 		}
 	}
+
 	return ""
 }
 
 // truncate 截断过长文本，避免把整段响应塞进日志。
+// 按字符截断而不是按字节，否则可能把一个中文字切成两半产生乱码。
 func truncate(s string, limit int) string {
 	s = strings.TrimSpace(s)
-	if len(s) <= limit {
+	r := []rune(s)
+	if len(r) <= limit {
 		return s
 	}
-	return s[:limit] + "...(truncated)"
+	return string(r[:limit]) + "...(truncated)"
 }
